@@ -1,0 +1,252 @@
+#include <opencv2/opencv.hpp>
+#include <iostream>
+#include <pthread.h>
+#include <semaphore.h>
+#include <arm_neon.h>
+
+using namespace cv;
+using namespace std;
+static cv::Mat to442_grayscale(cv::Mat * frame, int rows, int cols, int start_row);
+static cv::Mat to442_sobel(cv::Mat frame);
+cv::Mat global_sobel;
+
+int g_x[3][3] = {
+    {-1, 0, 1},
+    {-2, 0, 2},
+    {-1, 0, 1}
+};
+
+int g_y[3][3] = {
+    {1, 2, 1},
+    {0, 0, 0},
+    {-1, -2, -1}
+};
+
+
+typedef struct arguments {
+	cv::Mat* frame;
+	int start_row;
+	int out_start_row;
+	int out_rows;
+	int in_start_row;
+	int in_rows;
+	int num_cols;
+	
+
+} arguments;
+
+/*
+basis
+cv:mat sda
+
+sda = to442_grayscale
+	
+get semaphore
+do gray scale
+do sobel
+release semaphore
+*/
+
+static void * process_chunk(void * args) 
+{
+
+	int out_start = ((arguments *)args)->out_start_row;
+	int out_rows = ((arguments *)args)->out_rows;
+	int in_start = ((arguments *)args)->in_start_row;
+	int in_rows = ((arguments *)args)->in_rows;
+	int cols = ((arguments *)args)->num_cols;
+	cv::Mat* frame = ((arguments *)args)->frame;
+
+	cv::Mat gray = to442_grayscale(frame, in_rows, cols, in_start);
+	cv::Mat sobel = to442_sobel(gray);
+
+	int local_y0 = out_start - in_start;
+    int write_start = out_start;
+    int write_end   = out_start + out_rows;
+
+    for (int y = write_start; y < write_end; y++) {
+        if (y <= 0 || y >= frame->rows - 1) continue; // can't compute true sobel at global borders
+        uchar* srcRow = sobel.ptr<uchar>(local_y0 + (y - out_start));
+        uchar* dstRow = global_sobel.ptr<uchar>(y);
+        memcpy(dstRow, srcRow, cols);
+    }
+	return NULL;
+
+}
+
+
+
+
+static cv::Mat to442_grayscale(cv::Mat * frame, int rows, int cols, int start_row)
+{
+    cv::Mat gray(rows, cols, CV_8UC1);
+
+    for (int y = start_row; y < (start_row + rows); y++) {
+        cv::Vec3b * src = frame->ptr<cv::Vec3b>(y);
+        uchar* dst = gray.ptr<uchar>(y - start_row);
+	int x;
+        for (x = 0; x < cols - 16; x+= 16) {
+			//using 54 183 19 instead of 0.2126 0.7152 0.0722
+			//roughly 256x the value of the above to >> 8
+
+			//loads 16 bgr pixels at a time
+			// 3 vectors each holding 16, 8 bit values
+			// vld3q_u8 splits into 3
+			uint8x16x3_t bgr = vld3q_u8((uint8_t *)(src + x));
+
+
+			//need to split into lower and upper section due to arithmetic
+			// being done on 8 lanes at a time
+			uint8x8_t vec54 = vdup_n_u8(54);
+			uint8x8_t vec183 = vdup_n_u8(183);
+			uint8x8_t vec19 = vdup_n_u8(19);
+			//vmull_n_u8 = 8 unsigned 8 bit values multiplied by given value
+			//uint16x8_t = 8 lanes of 16 bit values
+			//vget gets upper or lower 8 bytes
+			uint16x8_t lowr = vmull_u8(vget_low_u8(bgr.val[2]), vec54);
+			//vmlal_n_u8 = multiply values by constant then add to accumulator
+			//vmlal is used when accumulator (lowg) is larger than factors
+			uint16x8_t lowg = vmlal_u8(lowr,vget_low_u8(bgr.val[1]), vec183);
+			uint16x8_t gray_low = vmlal_u8(lowg,vget_low_u8(bgr.val[0]),vec19);
+			
+			uint16x8_t highr = vmull_u8(vget_high_u8(bgr.val[2]), vec54);  //r 
+			uint16x8_t highg = vmlal_u8(highr, vget_high_u8(bgr.val[1]), vec183); //r + g
+			uint16x8_t gray_high = vmlal_u8(highg, vget_high_u8(bgr.val[0]), vec19); // r + g + b
+
+			//shift right by 8 bits(LCM of previous decimals) and narrow to 8 bit from 16 bit 
+			uint8x8_t out_low = vshrn_n_u16(gray_low, 8);
+            uint8x8_t out_high = vshrn_n_u16(gray_high, 8);
+
+			//combine the two sets of 8 bytes into 16 lanes of 8 bit values
+			uint8x16_t result = vcombine_u8(out_low, out_high);
+
+			//stores 16 grayscale pixels to memory at once
+			vst1q_u8(dst+x, result);
+        }
+		// deals with excess columns if column amt wasnt divisible by 16
+		for (; x < cols; x++) {
+			uchar b = src[x][0];
+			uchar g = src[x][1];
+			uchar r = src[x][2];
+
+			dst[x] = (54*r + 183*g + 19*b) >> 8;  
+		}
+    }
+    return gray;
+}
+
+static cv::Mat to442_sobel(cv::Mat frame)
+{
+	int rows = frame.rows;
+    int cols = frame.cols;
+    cv::Mat sobel = cv::Mat::zeros(frame.rows, frame.cols, CV_32F);
+
+    for (int y = 1; y < rows - 1; y++) {
+        uchar* outRow = sobel.ptr<uchar>(y);
+
+        for (int x = 1; x < cols - 1; x+= 8) {
+			//initalize to zero
+			int16x8_t sum_x = vdupq_n_s16(0);
+            int16x8_t sum_y = vdupq_n_s16(0);  
+			for (int a = -1; a <= 1; a++) {
+                uchar* rowPtr = frame.ptr<uchar>(y + a);
+                for (int b = -1; b <= 1; b++) {
+					//load 8 pixels from x + b
+					// 8 lanes (pixels) 8 bit each
+					uint8x8_t pixels = vld1_u8(rowPtr + x + b);
+					//convert to 16 bit signed
+					int16x8_t signed_16pixels = vreinterpretq_s16_u16(vmovl_u8(pixels));
+
+					int16_t kx = g_x[a+1][b+1];
+					int16_t ky = g_y[a +1][b+ 1];
+					//vmlaq can be used here because sum and pixels are both 16 bit long
+					sum_x = vmlaq_n_s16(sum_x, signed_16pixels, kx);
+					sum_y = vmlaq_n_s16(sum_y, signed_16pixels, ky);
+                }   
+            }
+			int16x8_t mag = vaddq_s16(vabsq_s16(sum_x), vabsq_s16(sum_y));
+			//move 16 bits into 8 bits and unsigns them
+			uint8x8_t out = vqmovun_s16(mag); 
+
+			//stores 8 pixels
+			vst1_u8(outRow + x, out);  
+        }
+        
+	}
+
+    return sobel;
+}
+
+int main(int argc, char** argv)
+{
+    if (argc < 2) {
+        cerr << "Usage: " << argv[0] << " <video_file_path>\n";
+        return 1;
+    }
+
+    const string videoPath = argv[1];
+    cv::VideoCapture cap(videoPath);
+
+    if (!cap.isOpened()) {
+        cerr << "Error: could not open video: " << videoPath << "\n";
+        return 2;
+    }
+
+    const string windowName = "Processed Video";
+    cv::namedWindow(windowName, cv::WINDOW_AUTOSIZE);
+
+    cv::Mat frame;
+	arguments quads[4];
+	pthread_t tids[4];
+	int i;
+	// arguments quad2;
+	// arguments quad3;
+	// arguments quad4;
+	
+
+    while (true) {
+        if (!cap.read(frame) || frame.empty()) {
+            // End of video (or read error)
+            std::cout << "video over or read error\n";
+            break;
+        }
+		global_sobel = cv::Mat(frame.rows, frame.cols, CV_8UC1);
+
+		int amtperquad = frame.rows /4;
+		for (i = 0; i < 4; i++) {
+
+			int out_start = i * amtperquad;
+			int out_end;
+			if (i == 3) {
+				out_end = frame.rows;
+			} else {
+				out_end = (i + 1) * amtperquad;
+			}
+			int out_rows  = out_end - out_start;
+
+			int in_start = max(0, out_start - 1);
+			int in_end   = min(frame.rows, out_end + 1);
+			int in_rows  = in_end - in_start;
+
+			quads[i].frame = &frame;
+			quads[i].out_start_row = out_start;
+			quads[i].out_rows = out_rows;
+			quads[i].in_start_row = in_start;
+			quads[i].in_rows = in_rows;
+			quads[i].num_cols = frame.cols;
+			pthread_create(&tids[i], NULL, process_chunk, &quads[i]);
+		}
+
+		for (int i = 0; i < 4; i++) {
+        	pthread_join(tids[i], NULL);
+    	}	
+		cv::imshow(windowName, global_sobel);
+    	cv::waitKey(1);
+
+       
+    }
+
+    cap.release();
+    cv::destroyAllWindows();
+    return 0;
+}
