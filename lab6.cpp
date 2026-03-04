@@ -224,6 +224,9 @@ int main(int argc, char** argv)
     const string videoPath = argv[1];
     cv::VideoCapture cap(videoPath);
 
+    const string windowName = "Processed Video";
+    cv::namedWindow(windowName, cv::WINDOW_AUTOSIZE);
+
     if (!cap.isOpened()) {
         cerr << "Error: could not open video: " << videoPath << "\n";
         return 2;
@@ -292,8 +295,8 @@ int main(int argc, char** argv)
 			total_cache_misses += frame_total_cache_misses / 4;
 		#endif
 
-		//cv::imshow(windowName, global_sobel);
-    	//cv::waitKey(1);
+		cv::imshow(windowName, global_sobel);
+    	cv::waitKey(1);
 
     }
 

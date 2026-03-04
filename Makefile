@@ -8,7 +8,7 @@ lab6: lab6.cpp
 	$(CXX) $(CXXFLAGS) $(OPENCV_CFLAGS) $^ -o $@ $(OPENCV_LIBS)
 
 clean:
-#	rm -f lab6
+	rm -f lab6
 
 .PHONY: clean
 obj-m += enable_pmu.o
