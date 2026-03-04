@@ -4,6 +4,28 @@
 #include <semaphore.h>
 #include <arm_neon.h>
 
+#define MEASURE_PERFORMANCE 1
+
+// PMU bit definitions
+#define PMCR_E          1    		// enable performance counting registers
+#define PMCR_C          (1 << 2)    // reset cycle counter
+#define PMCNTENSET_C    (1u << 31)  // cycle counter enable
+#define PMCNTENSET_E0   1 			// enable performance counting reg 0
+
+// Event codes for Cortex-A76
+#define PMU_EVENT_L1D_CACHE_MISS    0x03
+#define PMU_EVENT_L2D_CACHE_MISS    0x17
+
+typedef struct arguments {
+	cv::Mat* frame;
+	int start_row;
+	int out_start_row;
+	int out_rows;
+	int in_start_row;
+	int in_rows;
+	int num_cols;
+} arguments;
+
 using namespace cv;
 using namespace std;
 static cv::Mat to442_grayscale(cv::Mat * frame, int rows, int cols, int start_row);
@@ -22,34 +44,35 @@ int g_y[3][3] = {
     {-1, -2, -1}
 };
 
+uint64_t total_elapsed_cycles_frame;
+uint64_t total_elapsed_cycles;
 
-typedef struct arguments {
-	cv::Mat* frame;
-	int start_row;
-	int out_start_row;
-	int out_rows;
-	int in_start_row;
-	int in_rows;
-	int num_cols;
-	
+static inline void pmu_init(void) {
+    uint64_t pmcr;
+    asm volatile("mrs %0, pmcr_el0" : "=r"(pmcr)); // read pmcr register and store into pmcr var
+    pmcr |= PMCR_E | PMCR_C;					
+	// set bit 0 (E) — enables the PMU counters globally
+	// set bit 2 (C) — resets the cycle counter to zero
+    asm volatile("msr pmcr_el0, %0" :: "r"(pmcr)); // write the updated pmcr val to register
+    asm volatile("msr pmcntenset_el0, %0" :: "r"(PMCNTENSET_C | PMCNTENSET_E0)); // enable the cycle counter and counter 0
+	asm volatile("msr pmevtyper0_el0, %0" :: "r"(PMU_EVENT_L1D_CACHE_MISS)); // count cache misses in register 0
+}
 
-} arguments;
+static inline uint64_t read_cycles(void) {
+    uint64_t val;
+    asm volatile("isb; mrs %0, pmccntr_el0" : "=r"(val));
+    return val;
+}
 
-/*
-basis
-cv:mat sda
-
-sda = to442_grayscale
-	
-get semaphore
-do gray scale
-do sobel
-release semaphore
-*/
+static inline uint64_t read_cache_misses(void) {
+    uint32_t val;
+    asm volatile("mrs %0, pmevcntr0_el0" : "=r"(val)); // read counter 0
+    return val;
+}
 
 static void * process_chunk(void * args) 
 {
-
+	if (MEASURE_PERFORMANCE) uint64_t start = read_cycles();
 	int out_start = ((arguments *)args)->out_start_row;
 	int out_rows = ((arguments *)args)->out_rows;
 	int in_start = ((arguments *)args)->in_start_row;
@@ -70,12 +93,13 @@ static void * process_chunk(void * args)
         uchar* dstRow = global_sobel.ptr<uchar>(y);
         memcpy(dstRow, srcRow, cols);
     }
+
+	if (MEASURE_PERFORMANCE) {
+		uint64_t end = read_cycles();
+		total_elapsed_cycles_frame += end - start;
+	}
 	return NULL;
-
 }
-
-
-
 
 static cv::Mat to442_grayscale(cv::Mat * frame, int rows, int cols, int start_row)
 {
@@ -184,6 +208,10 @@ int main(int argc, char** argv)
         return 1;
     }
 
+	if (MEASURE_PERFORMANCE) {
+		pmu_init();
+	}
+
     const string videoPath = argv[1];
     cv::VideoCapture cap(videoPath);
 
@@ -203,13 +231,15 @@ int main(int argc, char** argv)
 	// arguments quad3;
 	// arguments quad4;
 	
-
+	long frame_num;
     while (true) {
         if (!cap.read(frame) || frame.empty()) {
             // End of video (or read error)
             std::cout << "video over or read error\n";
             break;
         }
+		
+		frame_num++;
 		global_sobel = cv::Mat(frame.rows, frame.cols, CV_8UC1);
 
 		int amtperquad = frame.rows /4;
@@ -240,13 +270,19 @@ int main(int argc, char** argv)
 		for (int i = 0; i < 4; i++) {
         	pthread_join(tids[i], NULL);
     	}	
+		
+		if (MEASURE_PERFORMANCE) {
+			total_elapsed_cycles += total_elapsed_cycles_frame / 4;
+		}
+
 		cv::imshow(windowName, global_sobel);
     	cv::waitKey(1);
 
-       
     }
 
     cap.release();
     cv::destroyAllWindows();
+
+	if (MEASURE_PERFORMANCE) printf("Average number of cycles per frame per core: %d\n", total_elapsed_cycles / frame_num);
     return 0;
 }
