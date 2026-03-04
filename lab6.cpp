@@ -221,8 +221,8 @@ int main(int argc, char** argv)
         return 2;
     }
 
-    const string windowName = "Processed Video";
-    cv::namedWindow(windowName, cv::WINDOW_AUTOSIZE);
+    // const string windowName = "Processed Video";
+    // cv::namedWindow(windowName, cv::WINDOW_AUTOSIZE);
 
     cv::Mat frame;
 	arguments quads[4];
@@ -282,7 +282,7 @@ int main(int argc, char** argv)
     }
 
     cap.release();
-    cv::destroyAllWindows();
+    // cv::destroyAllWindows();
 
 	if (MEASURE_PERFORMANCE) printf("Average number of cycles per frame per core: %ld\n", total_elapsed_cycles / frame_num);
     return 0;
