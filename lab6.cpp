@@ -72,7 +72,8 @@ static inline uint64_t read_cache_misses(void) {
 
 static void * process_chunk(void * args) 
 {
-	if (MEASURE_PERFORMANCE) uint64_t start = read_cycles();
+	uint64_t start;
+	if (MEASURE_PERFORMANCE) start = read_cycles();
 	int out_start = ((arguments *)args)->out_start_row;
 	int out_rows = ((arguments *)args)->out_rows;
 	int in_start = ((arguments *)args)->in_start_row;
@@ -275,14 +276,14 @@ int main(int argc, char** argv)
 			total_elapsed_cycles += total_elapsed_cycles_frame / 4;
 		}
 
-		cv::imshow(windowName, global_sobel);
-    	cv::waitKey(1);
+		//cv::imshow(windowName, global_sobel);
+    	//cv::waitKey(1);
 
     }
 
     cap.release();
     cv::destroyAllWindows();
 
-	if (MEASURE_PERFORMANCE) printf("Average number of cycles per frame per core: %d\n", total_elapsed_cycles / frame_num);
+	if (MEASURE_PERFORMANCE) printf("Average number of cycles per frame per core: %ld\n", total_elapsed_cycles / frame_num);
     return 0;
 }
